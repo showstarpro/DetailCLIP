@@ -1,5 +1,7 @@
 # [DetailCLIP](https://arxiv.org/pdf/2409.06809)
 
+March 2025 Paper accepted at [ICLR - Scaling Self-Improving Foundation Models without Human Supervision (SSI-FM)](https://sites.google.com/berkeley.edu/selfimprovingfoundationmodels/home)! 🎉
+
 Detail-Oriented CLIP for Fine-Grained Tasks ([Amin Karimi Monsefi](https://7amin.github.io/), [Kishore Prakash Sailaja](https://github.com/KishoreP1), [Ali Alilooee](https://cse.osu.edu/people/alilooeedolatabad.1), [Ser-Nam Lim](https://sites.google.com/site/sernam), [Rajiv Ramnath](https://cse.osu.edu/people/ramnath.6))
 
 DetailCLIP enhances CLIP-based models for fine-grained tasks like segmentation by using patch-level comparison and pixel-level reconstruction, with an attention-based token removal to focus on semantically relevant details. This results in superior segmentation accuracy and generalization across diverse datasets.
