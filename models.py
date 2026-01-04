@@ -8,7 +8,7 @@ import numpy as np
 import timm
 import torch
 from torch import nn
-import torchvision.transforms.functional_tensor as F_t
+import torchvision.transforms.functional as F_t
 from functools import partial
 
 from timm.models.vision_transformer import VisionTransformer, Block

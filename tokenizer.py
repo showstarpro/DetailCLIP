@@ -144,8 +144,8 @@ class SimpleTokenizer(object):
         result = torch.zeros(len(all_tokens), context_length, dtype=torch.long)
 
         for i, tokens in enumerate(all_tokens):
-            if len(tokens) > context_length:
-                print(f"Input {texts[i]} is too long for context length {context_length}")
+            # if len(tokens) > context_length:
+            #     print(f"Input {texts[i]} is too long for context length {context_length}")
             tokens = tokens[:context_length]
             result[i, :len(tokens)] = torch.tensor(tokens)
 

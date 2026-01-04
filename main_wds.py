@@ -25,7 +25,7 @@ import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
 
-from datasets import get_dataset
+from data import get_data
 import models
 from tokenizer import SimpleTokenizer
 from utils import AverageMeter, ProgressMeter, accuracy
@@ -39,11 +39,91 @@ import torch.distributed as dist
 def get_args_parser():
     parser = argparse.ArgumentParser(description='DetailCLIP pre-training and evaluation', add_help=False)
     # Data
-    parser.add_argument('--dataset', default='yfcc15m', type=str, choices=['yfcc15m', 'cc3m', 'cc12m', 'coco', 'redcaps'])
-    parser.add_argument('--metadata', default='yfcc15m.pkl', type=str,
-                    help='path to metadata file (see README for details)')
-    parser.add_argument('--root', default='', type=str,
-                        help='path to dataset root')
+    ## Based on open_clip ##
+    parser.add_argument(
+            "--train-data",
+            type=str,
+            default='/lpai/dataset/yfcc15m/0-1-6/yfcc15m_webdataset/0{0000..1410}.tar',
+            help="Path to file(s) with training data. When using webdataset, multiple datasources can be combined using the `::` separator.",
+        )
+    parser.add_argument(
+        "--train-data-upsampling-factors",
+        type=str,
+        default=None,
+        help=(
+            "When using multiple data sources with webdataset and sampling with replacement, this can be used to upsample specific data sources. "
+            "Similar to --train-data, this should be a string with as many numbers as there are data sources, separated by `::` (e.g. 1::2::0.5) "
+            "By default, datapoints are sampled uniformly regardless of the dataset sizes."
+        )
+    )
+    parser.add_argument(
+        "--val-data",
+        type=str,
+        default=None,
+        help="Path to file(s) with validation data",
+    )
+    parser.add_argument(
+        "--train-num-samples",
+        type=int,
+        default=14082031,
+        help="Number of samples in dataset. Required for webdataset if not available in info file.",
+    )
+    parser.add_argument(
+        "--val-num-samples",
+        type=int,
+        default=None,
+        help="Number of samples in dataset. Useful for webdataset if not available in info file.",
+    )
+    parser.add_argument(
+        "--dataset-type",
+        choices=["webdataset", "csv", "synthetic", "auto"],
+        default="webdataset",
+        help="Which type of dataset to process."
+    )
+    parser.add_argument(
+        "--dataset-resampled",
+        default=False,
+        action="store_true",
+        help="Whether to use sampling with replacement for webdataset shard selection."
+    )
+    parser.add_argument(
+        "--csv-separator",
+        type=str,
+        default="\t",
+        help="For csv-like datasets, which separator to use."
+    )
+    parser.add_argument(
+        "--csv-img-key",
+        type=str,
+        default="filepath",
+        help="For csv-like datasets, the name of the key for the image paths."
+    )
+    parser.add_argument(
+        "--csv-caption-key",
+        type=str,
+        default="title",
+        help="For csv-like datasets, the name of the key for the captions."
+    )
+    parser.add_argument(
+        "--imagenet-val",
+        type=str,
+        default='/lpai/dataset/imagenet-1k/0-1-0/ILSVRC2012/val',
+        help="Path to imagenet val set for conducting zero shot evaluation.",
+    )
+    parser.add_argument(
+        "--imagenet-v2",
+        type=str,
+        default=None,
+        help="Path to imagenet v2 for conducting zero shot evaluation.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="Override system default cache path for model & tokenizer file downloads.",
+    )
+    ## Based on open_clip ##
+
     parser.add_argument('--output-dir', default='./', type=str, help='path where to save, empty for no saving')
 
     # Data Augmentation
@@ -196,31 +276,16 @@ def get_loader(args, tokenizer):
             normalize
         ])
 
-    train_dataset = get_dataset(train_transform, tokenizer, args)
-    cwd = os.path.dirname(os.path.realpath(__file__))
-    with open(os.path.join(cwd, 'dataset_catalog.json')) as f:
-        root = json.load(f)['imagenet']['path']
-    #add val folder for imagenet 1k
-    val_dataset = ImageFolder(os.path.join(root, 'val'), val_transform)
+    # train_dataset = get_dataset(train_transform, tokenizer, args)
+    data = get_data(
+        args,
+        (train_transform, val_transform),
+        epoch=args.start_epoch,
+        tokenizer=tokenizer,
+    )
 
-    # dist eval resamples data to pad uneven batch sizes
-    # make sure num_samples = 0 mod num_gpus for exact acc
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
-    else:
-        train_sampler = None
-        val_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
-
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=(val_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=val_sampler, drop_last=False)
     
-    return train_loader, train_sampler, val_loader
+    return data
    
 def main(args):
     cuda_version = torch.version.cuda
@@ -231,42 +296,8 @@ def main(args):
     print(f"CUDA Version: {cuda_version}")
     print(f"cuDNN Version: {cudnn_version}")
 
-    ## initialize slurm distributed training environment
-    proc_id = int(os.environ['SLURM_PROCID'])
-    print(f"proc_id {proc_id}")
-    ntasks = int(os.environ['SLURM_NTASKS'])
-    print(f"ntasks {ntasks}")
-    node_list = os.environ['SLURM_NODELIST']
-    print(f"node_list {node_list}")
-    num_gpus = torch.cuda.device_count()
-    print(f"num_gpus {num_gpus}")
-    print(f"torch.cuda.is_available() {torch.cuda.is_available()}")
-    torch.cuda.set_device(proc_id % num_gpus)
-    # addr = subprocess.getoutput(
-    #     f'scontrol show hostname {node_list} | head -n1')
-    # specify master port
-    if args.port is not None:
-        os.environ['MASTER_PORT'] = str(args.port)
-    elif 'MASTER_PORT' in os.environ:
-        pass  # use MASTER_PORT in the environment variable
-    else:
-        # 29500 is torch.distributed default port
-        os.environ['MASTER_PORT'] = '29500'
-    os.environ['WORLD_SIZE'] = str(ntasks)
-    # os.environ['RANK'] = str(proc_id)
+    utils.init_distributed_mode(args)
 
-    #utils.init_distributed_mode(args)
-    ##---------------------------------
-    #os.environ['MASTER_ADDR'] = addr
-    os.environ['WORLD_SIZE'] = str(ntasks)
-    os.environ['RANK'] = str(proc_id)
-    print('| distributed init (rank {}): {}'.format(
-        int(os.environ["RANK"]), args.dist_url), flush=True)
-    args.distributed = True
-    dist.init_process_group(backend='nccl')
-    torch.distributed.barrier()
-    utils.setup_for_distributed(args.rank == 0)
-    ##---------------------------------
     cudnn.benchmark = True
 
     args.best_acc = 0
@@ -290,7 +321,8 @@ def main(args):
     
     # Data loading 
     tokenizer = SimpleTokenizer()
-    train_loader, train_sampler, val_loader = get_loader(args, tokenizer)
+    data = get_loader(args, tokenizer)
+    val_loader = data['imagenet-val'].dataloader
 
     if args.evaluate:
         zero_stats = validate_zeroshot(val_loader, model, tokenizer, args)
@@ -299,10 +331,11 @@ def main(args):
                 f.write(json.dumps(zero_stats) + '\n')
         return
     
+    len_train_loader = data["train"].dataloader.num_batches
     lr_schedule = utils.cosine_scheduler(args.lr, args.lr_end, args.epochs,
-        len(train_loader) // args.update_freq, warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start)
+        len_train_loader // args.update_freq, warmup_epochs=args.warmup_epochs, start_warmup_value=args.lr_start)
 
-    momentum_schedule = utils.cosine_scheduler(args.momentum_ema, 1, args.epochs, len(train_loader), 0)
+    momentum_schedule = utils.cosine_scheduler(args.momentum_ema, 1, args.epochs, len_train_loader, 0)
 
     if utils.is_main_process() and args.wandb:
         wandb_id = os.path.split(args.output_dir)[-1]
@@ -313,9 +346,10 @@ def main(args):
     print("=> beginning training")
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
-            train_sampler.set_epoch(epoch)
+            data['train'].set_epoch(epoch)
 
         # train for one epoch
+        train_loader = data["train"].dataloader
         train_stats = train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule, momentum_schedule, args)
 
         if (epoch + 1) % args.eval_freq != 0:
@@ -355,7 +389,7 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
     data_time = AverageMeter('Data', ':6.2f')
     mem = AverageMeter('Mem (GB)', ':6.3f')
     metric_names = get_metric_names()
-    iters_per_epoch = len(train_loader) // args.update_freq
+    iters_per_epoch = train_loader.num_batches // args.update_freq
     metrics = OrderedDict([(name, AverageMeter(name, ':.2e')) for name in metric_names])
     progress = ProgressMeter(
         iters_per_epoch,
@@ -375,7 +409,7 @@ def train(train_loader, model, criterion, optimizer, scaler, epoch, lr_schedule,
         for k, param_group in enumerate(optimizer.param_groups):
             param_group['lr'] = lr_schedule[it]
         
-        online_inputs = [inputs[0][0], inputs[0][1], inputs[1]] # aug1, aug2, text
+        online_inputs = [inputs[0], inputs[1], inputs[2]] # aug1, aug2, text
         online_inputs = [tensor.cuda(args.gpu, non_blocking=True) for tensor in online_inputs]
 
         m = momentum_schedule[it]  # momentum parameter
